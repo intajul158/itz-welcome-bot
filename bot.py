@@ -1,6 +1,8 @@
 import json
 import os
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
 from telegram.ext import (
@@ -15,18 +17,12 @@ from telegram.ext import (
 # SETTINGS
 # =========================
 
-BOT_TOKEN = "8644485641:AAFJdbNKciBE3PWHIjGBplmBM1sVzeCTQg4"
-
-# তোমার Telegram numeric User ID
-ADMIN_ID = 7590910189
-
-# Developer username
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8644485641:AAFJdbNKciBE3PWHIjGBplmBM1sVzeCTQg4")
 DEVELOPER_USERNAME = "@iTZ_ADMINS"
 
-# প্রতি ২ মিনিট
 INTERVAL = 120
-
 DATA_FILE = "bot_data.json"
+PORT = int(os.getenv("PORT", "10000"))
 
 
 # =========================
@@ -35,8 +31,30 @@ DATA_FILE = "bot_data.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
+
+
+# =========================
+# HEALTH SERVER
+# =========================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logging.info(f"Health server running on port {PORT}")
+    server.serve_forever()
 
 
 # =========================
@@ -46,17 +64,23 @@ logging.basicConfig(
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {
-            "message": None,
-            "groups": []
+            "users": {},
+            "groups": {}
         }
 
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return {
+            "users": {},
+            "groups": {}
+        }
 
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
 
 
 data = load_data()
@@ -66,10 +90,32 @@ data = load_data()
 # ADMIN CHECK
 # =========================
 
-def is_admin(update: Update):
-    return (
-        update.effective_user
-        and update.effective_user.id == ADMIN_ID
+async def is_group_admin(update: Update):
+
+    if update.effective_chat.type not in [
+        "group",
+        "supergroup"
+    ]:
+        return False
+
+    member = await update.effective_chat.get_member(
+        update.effective_user.id
+    )
+
+    return member.status in [
+        "administrator",
+        "creator"
+    ]
+
+
+# =========================
+# ADMIN-ONLY MESSAGE
+# =========================
+
+async def admin_only(update: Update):
+
+    await update.message.reply_text(
+        "⚠️ This command is only for admins."
     )
 
 
@@ -77,48 +123,238 @@ def is_admin(update: Update):
 # /START
 # =========================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not is_admin(update):
-        await update.message.reply_text(
-            "❌ You are not authorized."
-        )
-        return
+    chat = update.effective_chat
+    user_id = str(update.effective_user.id)
 
-    if update.effective_chat.type in ["group", "supergroup"]:
+    # GROUP
+    if chat.type in ["group", "supergroup"]:
 
-        if not data["message"]:
+        if not await is_group_admin(update):
+            await admin_only(update)
+            return
+
+        if user_id not in data["users"]:
             await update.message.reply_text(
-                "⚠️ First set a message using /setmessage."
+                "⚠️ First set your message in private chat "
+                "using /setmessage."
             )
             return
 
-        chat_id = update.effective_chat.id
+        message = data["users"][user_id].get("message")
 
-        if chat_id not in data["groups"]:
-            data["groups"].append(chat_id)
-            save_data(data)
+        if not message:
+            await update.message.reply_text(
+                "⚠️ First set your message in private chat "
+                "using /setmessage."
+            )
+            return
+
+        group_id = str(chat.id)
+
+        data["groups"][group_id] = {
+            "user_id": user_id,
+            "enabled": True
+        }
+
+        save_data()
 
         await update.message.reply_text(
             "🟢 Scheduler Started!\n\n"
-            "Message will be sent every 2 minutes."
+            "Your saved message will be sent every 2 minutes."
         )
+        return
 
-    else:
+    # PRIVATE
+    if chat.type == "private":
+
+        if user_id not in data["users"]:
+            data["users"][user_id] = {
+                "message": None
+            }
+            save_data()
 
         await update.message.reply_text(
             f"👋 Welcome!\n\n"
             f"🤖 Scheduled Announcement Bot\n"
             f"👨‍💻 Developer: {DEVELOPER_USERNAME}\n\n"
-            f"📩 Use /setmessage to set your message.\n\n"
+            f"📩 Use /setmessage to save your message.\n\n"
             f"📚 Commands:\n"
-            f"/start - Start bot / scheduler\n"
-            f"/help - Show help\n"
-            f"/ls - Command list\n"
-            f"/setmessage - Set message\n"
+            f"/start - Start\n"
+            f"/setmessage - Set your message\n"
             f"/status - Check status\n"
-            f"/disable - Stop scheduler"
+            f"/disable - Stop scheduler\n"
+            f"/help - Help\n"
+            f"/ls - Command list\n"
+            f"/lt - Admin command information"
         )
+
+
+# =========================
+# /SETMESSAGE
+# =========================
+
+async def setmessage(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat = update.effective_chat
+    user_id = str(update.effective_user.id)
+
+    # GROUP
+    if chat.type in ["group", "supergroup"]:
+
+        if not await is_group_admin(update):
+            await admin_only(update)
+            return
+
+        await update.message.reply_text(
+            "📩 Please use /setmessage in the bot's "
+            "private chat."
+        )
+        return
+
+    # PRIVATE
+    if chat.type == "private":
+
+        data["users"].setdefault(
+            user_id,
+            {"message": None}
+        )
+
+        context.user_data["waiting_message"] = True
+
+        await update.message.reply_text(
+            "📩 Send me your announcement message now."
+        )
+
+
+# =========================
+# RECEIVE PRIVATE MESSAGE
+# =========================
+
+async def receive_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if update.effective_chat.type != "private":
+        return
+
+    if not context.user_data.get("waiting_message"):
+        return
+
+    user_id = str(update.effective_user.id)
+
+    if not update.message.text:
+        await update.message.reply_text(
+            "⚠️ Please send a text message."
+        )
+        return
+
+    data["users"].setdefault(
+        user_id,
+        {"message": None}
+    )
+
+    data["users"][user_id]["message"] = update.message.text
+
+    context.user_data["waiting_message"] = False
+
+    save_data()
+
+    await update.message.reply_text(
+        "✅ Message saved successfully!\n\n"
+        "Now add the bot to your group and use "
+        "/start there as a group admin."
+    )
+
+
+# =========================
+# /DISABLE
+# =========================
+
+async def disable(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat = update.effective_chat
+
+    if chat.type not in ["group", "supergroup"]:
+        await update.message.reply_text(
+            "⚠️ Use /disable inside your group."
+        )
+        return
+
+    if not await is_group_admin(update):
+        await admin_only(update)
+        return
+
+    group_id = str(chat.id)
+
+    if group_id in data["groups"]:
+        data["groups"][group_id]["enabled"] = False
+        save_data()
+
+        await update.message.reply_text(
+            "🔴 Scheduler Disabled."
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ Scheduler is already disabled."
+        )
+
+
+# =========================
+# /STATUS
+# =========================
+
+async def status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat = update.effective_chat
+
+    if chat.type in ["group", "supergroup"]:
+
+        if not await is_group_admin(update):
+            await admin_only(update)
+            return
+
+        group_id = str(chat.id)
+
+        group = data["groups"].get(group_id)
+
+        if group and group.get("enabled"):
+            scheduler = "🟢 ON"
+        else:
+            scheduler = "🔴 OFF"
+
+        await update.message.reply_text(
+            f"📊 Group Status\n\n"
+            f"Scheduler: {scheduler}\n"
+            f"Interval: 2 minutes"
+        )
+        return
+
+    # PRIVATE
+    user_id = str(update.effective_user.id)
+
+    user = data["users"].get(user_id, {})
+    message = user.get("message")
+
+    await update.message.reply_text(
+        f"📊 Your Status\n\n"
+        f"Message: "
+        f"{'✅ Set' if message else '❌ Not set'}"
+    )
 
 
 # =========================
@@ -130,22 +366,34 @@ async def help_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_admin(update):
+    chat = update.effective_chat
+
+    if chat.type in ["group", "supergroup"]:
+
+        if not await is_group_admin(update):
+            await admin_only(update)
+            return
+
         await update.message.reply_text(
-            "❌ You are not authorized."
+            "📚 GROUP ADMIN COMMANDS\n\n"
+            "/start - Start scheduler\n"
+            "/disable - Stop scheduler\n"
+            "/status - Check status\n"
+            "/setmessage - Set message in private chat\n"
+            "/lt - Admin command information\n\n"
+            "⏱ Interval: 2 minutes\n"
+            "🔐 Only group admins can control the scheduler."
         )
         return
 
     await update.message.reply_text(
-        "📚 COMMAND LIST\n\n"
-        "/start - Start bot or scheduler\n"
-        "/help - Show this help\n"
-        "/ls - Show command list\n"
-        "/setmessage - Set announcement\n"
-        "/status - Check status\n"
-        "/disable - Stop scheduler\n\n"
-        "⏱ Interval: 2 minutes\n"
-        "🔐 Admin only control"
+        "📚 PRIVATE COMMANDS\n\n"
+        "/start - Start\n"
+        "/setmessage - Set your message\n"
+        "/status - Check your status\n"
+        "/help - Help\n"
+        "/ls - Command list\n"
+        "/lt - Admin command information"
     )
 
 
@@ -162,147 +410,40 @@ async def ls_command(
 
 
 # =========================
-# /SETMESSAGE
+# /LT
 # =========================
 
-async def setmessage(
+async def lt_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_admin(update):
+    chat = update.effective_chat
+
+    if chat.type in ["group", "supergroup"]:
+
+        if not await is_group_admin(update):
+            await update.message.reply_text(
+                "⚠️ This command is only for admins."
+            )
+            return
+
         await update.message.reply_text(
-            "❌ You are not authorized."
+            "🔐 Admin Command\n\n"
+            "Only group administrators can manage "
+            "the scheduler.\n\n"
+            "/start - Start scheduler\n"
+            "/disable - Stop scheduler\n"
+            "/status - Check status\n"
+            "/setmessage - Set message privately"
         )
         return
-
-    if update.effective_chat.type != "private":
-        await update.message.reply_text(
-            "⚠️ Use /setmessage in private chat."
-        )
-        return
-
-    context.user_data["waiting_message"] = True
 
     await update.message.reply_text(
-        "📩 Send me your announcement message now."
+        "🔐 /lt\n\n"
+        "Group management commands are available "
+        "only to group administrators."
     )
-
-
-# =========================
-# RECEIVE MESSAGE
-# =========================
-
-async def receive_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_admin(update):
-        return
-
-    if update.effective_chat.type != "private":
-        return
-
-    if not context.user_data.get("waiting_message"):
-        return
-
-    data["message"] = update.message.text
-
-    context.user_data["waiting_message"] = False
-
-    save_data(data)
-
-    await update.message.reply_text(
-        "✅ Message saved successfully!\n\n"
-        "Now add the bot to your authorized group "
-        "and use /start there."
-    )
-
-
-# =========================
-# /DISABLE
-# =========================
-
-async def disable(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_admin(update):
-        await update.message.reply_text(
-            "❌ You are not authorized."
-        )
-        return
-
-    if update.effective_chat.type not in [
-        "group",
-        "supergroup"
-    ]:
-        await update.message.reply_text(
-            "⚠️ Use /disable inside the group."
-        )
-        return
-
-    chat_id = update.effective_chat.id
-
-    if chat_id in data["groups"]:
-
-        data["groups"].remove(chat_id)
-        save_data(data)
-
-        await update.message.reply_text(
-            "🔴 Scheduler Disabled."
-        )
-
-    else:
-
-        await update.message.reply_text(
-            "ℹ️ Scheduler is already disabled."
-        )
-
-
-# =========================
-# /STATUS
-# =========================
-
-async def status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not is_admin(update):
-        await update.message.reply_text(
-            "❌ You are not authorized."
-        )
-        return
-
-    chat_id = update.effective_chat.id
-
-    if update.effective_chat.type in [
-        "group",
-        "supergroup"
-    ]:
-
-        running = chat_id in data["groups"]
-
-        await update.message.reply_text(
-            f"📊 Status\n\n"
-            f"Scheduler: "
-            f"{'🟢 ON' if running else '🔴 OFF'}\n"
-            f"Message: "
-            f"{'✅ Set' if data['message'] else '❌ Not set'}\n"
-            f"Interval: 2 minutes"
-        )
-
-    else:
-
-        await update.message.reply_text(
-            f"📊 Bot Status\n\n"
-            f"Message: "
-            f"{'✅ Set' if data['message'] else '❌ Not set'}\n"
-            f"Active groups: {len(data['groups'])}"
-        )
 
 
 # =========================
@@ -313,22 +454,33 @@ async def send_scheduled_message(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not data["message"]:
-        return
+    for group_id, group in list(data["groups"].items()):
 
-    for chat_id in data["groups"].copy():
+        if not group.get("enabled"):
+            continue
+
+        user_id = str(group.get("user_id"))
+
+        user = data["users"].get(user_id)
+
+        if not user:
+            continue
+
+        message = user.get("message")
+
+        if not message:
+            continue
 
         try:
-
             await context.bot.send_message(
-                chat_id=chat_id,
-                text=data["message"]
+                chat_id=int(group_id),
+                text=message
             )
 
         except Exception as error:
 
             logging.error(
-                f"Could not send to {chat_id}: {error}"
+                f"Could not send to {group_id}: {error}"
             )
 
 
@@ -337,6 +489,13 @@ async def send_scheduled_message(
 # =========================
 
 def main():
+
+    # Render health server
+    health_thread = threading.Thread(
+        target=start_health_server,
+        daemon=True
+    )
+    health_thread.start()
 
     app = (
         Application.builder()
@@ -349,14 +508,6 @@ def main():
     )
 
     app.add_handler(
-        CommandHandler("help", help_command)
-    )
-
-    app.add_handler(
-        CommandHandler("ls", ls_command)
-    )
-
-    app.add_handler(
         CommandHandler("setmessage", setmessage)
     )
 
@@ -366,6 +517,18 @@ def main():
 
     app.add_handler(
         CommandHandler("status", status)
+    )
+
+    app.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    app.add_handler(
+        CommandHandler("ls", ls_command)
+    )
+
+    app.add_handler(
+        CommandHandler("lt", lt_command)
     )
 
     app.add_handler(
@@ -382,7 +545,7 @@ def main():
         first=INTERVAL
     )
 
-    print("Bot is running...")
+    logging.info("Bot is running...")
 
     app.run_polling()
 
